@@ -28,25 +28,36 @@ padrão `XX`. A única suíte prevista para a versão 0.1 é:
 Noise_XX_25519_ChaChaPoly_SHA256
 ```
 
-O estado atual é um laboratório executado em um único processo. Ele realiza um
-handshake completo em memória entre Alice e Bob, confirma que ambos obtiveram o
-mesmo channel-binding value, formata o handshake hash completo como fingerprint
-e inclui testes controlados de adulteração do handshake.
+O estado atual executa o handshake Noise XX entre dois processos reais por uma
+conexão TCP loopback. As três mensagens do handshake usam frames formados por
+um comprimento `u32` big-endian seguido do body, limitado a 8192 bytes. Ambos
+os lados concluem o handshake e exibem o mesmo fingerprint completo derivado do
+channel-binding value.
+
+Depois do handshake, a sessão continua `UNVERIFIED`. O laboratório cria e
+descarta o estado de transporte sem enviar mensagens de aplicação.
 
 Ainda não existem:
 
-- transporte TCP;
-- chat real entre processos;
+- `VERIFY_CONFIRMED` ou transição para `VERIFIED`;
+- mensagens `CHAT`;
+- encerramento autenticado por `CLOSE`;
 - GUI ou versão Android;
 - anonimato de rede; ou
 - suporte para uso em produção.
 
 ## Execução
 
-Para executar o laboratório atual:
+Em um terminal, inicie o responder:
 
 ```console
-cargo run
+cargo run -- listen 127.0.0.1:7777
+```
+
+Em outro terminal, inicie o initiator:
+
+```console
+cargo run -- connect 127.0.0.1:7777
 ```
 
 Para executar os testes:
@@ -54,6 +65,11 @@ Para executar os testes:
 ```console
 cargo test
 ```
+
+Atualmente existem 18 testes cobrindo o laboratório Noise em memória, framing,
+handshake por TCP loopback e cenários adversariais controlados. Entre eles estão
+a rejeição de frames inválidos ou truncados, interrupções de conexão, payloads
+de handshake não vazios e adulterações das mensagens Noise.
 
 ## Documentação de segurança
 
