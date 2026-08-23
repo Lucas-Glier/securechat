@@ -37,12 +37,15 @@ channel-binding value.
 Depois do handshake, a sessão permanece `UNVERIFIED` até cada usuário comparar
 o fingerprint completo por um canal independente, confirmar localmente a
 igualdade e receber um `VERIFY_CONFIRMED` autenticado do peer. Somente as duas
-condições levam a `VERIFIED`. Como `CHAT` ainda não existe, o laboratório então
-executa um encerramento autenticado e recíproco com `CLOSE`.
+condições levam a `VERIFIED`. Nesse estado, os peers podem trocar mensagens
+`CHAT` UTF-8 autenticadas e criptografadas, com conteúdo de 1 a 4096 bytes. O
+comando local `/sair` inicia um encerramento autenticado e recíproco com
+`CLOSE(NORMAL)`. Uma sessão `VERIFIED` inativa por 15 minutos inicia
+`CLOSE(IDLE_TIMEOUT)`.
 
 Ainda não existem:
 
-- mensagens `CHAT`;
+- histórico, arquivos ou anexos;
 - GUI ou versão Android;
 - anonimato de rede; ou
 - suporte para uso em produção.
@@ -67,12 +70,12 @@ Para executar os testes:
 cargo test
 ```
 
-Atualmente existem 34 testes cobrindo o laboratório Noise em memória, framing,
+Atualmente existem 49 testes cobrindo o laboratório Noise em memória, framing,
 handshake por TCP loopback, verificação explícita, controles criptografados,
-`CLOSE` e cenários adversariais controlados. Entre eles estão a rejeição de
-frames inválidos ou truncados, interrupções de conexão, payloads de handshake
-não vazios, adulteração, replay, reflexão, reordenação e tentativas de alcançar
-`VERIFIED` sem confirmação local.
+`CHAT`, `CLOSE`, idle timeout e cenários adversariais controlados. Entre eles
+estão limites de mensagem, UTF-8 inválido, rejeição de frames truncados,
+interrupções de conexão, adulteração, replay, reflexão, reordenação e tentativas
+de usar mensagens fora do estado correto.
 
 ## Documentação de segurança
 

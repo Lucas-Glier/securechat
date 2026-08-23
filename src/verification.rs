@@ -2,21 +2,42 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::DynError;
-use crate::framing::{escrever_frame, ler_frame};
+use crate::framing::{escrever_frame, ler_frame_sessao};
 use crate::noise_lab::CanalNoise;
 use crate::tcp_handshake::SessaoEstabelecida;
+use zeroize::Zeroize;
 
 const VERIFY_CONFIRMED: u8 = 0x01;
 const CHAT: u8 = 0x02;
 const CLOSE: u8 = 0x03;
 const TRANSPORT_BUFFER_SIZE: usize = 8192;
+pub const MAX_CHAT_CONTENT: usize = 4096;
 pub const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const CLOSE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const VERIFIED_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+struct ControleIdle {
+    duracao: Duration,
+    deadline: Instant,
+}
+
+impl ControleIdle {
+    fn new(duracao: Duration, agora: Instant) -> Self {
+        Self {
+            duracao,
+            deadline: agora + duracao,
+        }
+    }
+
+    fn registrar_atividade(&mut self, agora: Instant) {
+        self.deadline = agora + self.duracao;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EstadoSessao {
@@ -48,6 +69,7 @@ impl MotivoClose {
 
 pub enum EventoRemoto {
     VerifyConfirmed,
+    Chat(String),
     Close {
         motivo: MotivoClose,
         resposta: Option<Vec<u8>>,
@@ -149,6 +171,30 @@ impl SessaoVerificacao {
         Ok(ciphertext)
     }
 
+    pub fn enviar_chat(&mut self, conteudo: &str) -> Result<Vec<u8>, ErroSessao> {
+        self.exigir_estado(EstadoSessao::Verified)?;
+        let tamanho = conteudo.len();
+        if tamanho == 0 {
+            return Err(ErroSessao::novo(
+                CategoriaErroSessao::Protocolo,
+                "CHAT vazio",
+            ));
+        }
+        if tamanho > MAX_CHAT_CONTENT {
+            return Err(ErroSessao::novo(
+                CategoriaErroSessao::Protocolo,
+                "CHAT excede 4096 bytes",
+            ));
+        }
+
+        let mut plaintext = Vec::with_capacity(tamanho + 1);
+        plaintext.push(CHAT);
+        plaintext.extend_from_slice(conteudo.as_bytes());
+        let resultado = self.cifrar(&plaintext);
+        plaintext.zeroize();
+        resultado
+    }
+
     pub fn processar_ciphertext(&mut self, ciphertext: &[u8]) -> Result<EventoRemoto, ErroSessao> {
         if matches!(self.estado, EstadoSessao::Closed | EstadoSessao::Failed) {
             return Err(ErroSessao::novo(
@@ -173,12 +219,14 @@ impl SessaoVerificacao {
             }
         };
 
-        match &plaintext[..tamanho] {
+        let resultado = match &plaintext[..tamanho] {
             [VERIFY_CONFIRMED] => self.receber_verify_confirmed(),
             [CLOSE, motivo] => self.receber_close(*motivo),
-            [CHAT, ..] => self.falhar_protocolo("CHAT não é permitido nesta etapa"),
+            [CHAT, conteudo @ ..] => self.receber_chat(conteudo),
             _ => self.falhar_protocolo("mensagem de aplicação inválida ou desconhecida"),
-        }
+        };
+        plaintext[..tamanho].zeroize();
+        resultado
     }
 
     pub fn iniciar_close(&mut self, motivo: MotivoClose) -> Result<Vec<u8>, ErroSessao> {
@@ -225,6 +273,11 @@ impl SessaoVerificacao {
         Ok(ciphertext)
     }
 
+    pub fn timeout_idle(&mut self) -> Result<Vec<u8>, ErroSessao> {
+        self.exigir_estado(EstadoSessao::Verified)?;
+        self.iniciar_close(MotivoClose::IdleTimeout)
+    }
+
     pub fn concluir_close_recebido(&mut self) {
         if self.peer_close_received {
             self.estado = EstadoSessao::Closed;
@@ -250,13 +303,31 @@ impl SessaoVerificacao {
     }
 
     fn receber_verify_confirmed(&mut self) -> Result<EventoRemoto, ErroSessao> {
-        self.exigir_estado(EstadoSessao::Unverified)?;
+        if self.estado != EstadoSessao::Unverified {
+            return self.falhar_protocolo("VERIFY_CONFIRMED fora de UNVERIFIED");
+        }
         if self.peer_confirmed {
             return self.falhar_protocolo("VERIFY_CONFIRMED remoto duplicado");
         }
         self.peer_confirmed = true;
         self.atualizar_verified();
         Ok(EventoRemoto::VerifyConfirmed)
+    }
+
+    fn receber_chat(&mut self, conteudo: &[u8]) -> Result<EventoRemoto, ErroSessao> {
+        self.exigir_estado(EstadoSessao::Verified)
+            .or_else(|_| self.falhar_protocolo("CHAT fora de VERIFIED"))?;
+        if conteudo.is_empty() {
+            return self.falhar_protocolo("CHAT vazio");
+        }
+        if conteudo.len() > MAX_CHAT_CONTENT {
+            return self.falhar_protocolo("CHAT excede 4096 bytes");
+        }
+        let conteudo = match std::str::from_utf8(conteudo) {
+            Ok(conteudo) => conteudo.to_owned(),
+            Err(_) => return self.falhar_protocolo("CHAT contém UTF-8 inválido"),
+        };
+        Ok(EventoRemoto::Chat(conteudo))
     }
 
     fn receber_close(&mut self, valor: u8) -> Result<EventoRemoto, ErroSessao> {
@@ -342,24 +413,42 @@ enum DecisaoUsuario {
 }
 
 enum EventoRuntime {
-    Usuario(DecisaoUsuario),
+    Verificacao(DecisaoUsuario),
+    LinhaChat(LinhaPendente),
+    EncerrarLocalmente,
     Rede(Result<Vec<u8>, io::Error>),
+}
+
+struct LinhaPendente(String);
+
+impl LinhaPendente {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for LinhaPendente {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 pub fn executar_verificacao_interativa(
     sessao: SessaoEstabelecida,
 ) -> Result<ResultadoInterativo, DynError> {
-    executar_verificacao_interativa_com_timeout(sessao, VERIFICATION_TIMEOUT)
+    executar_sessao_interativa_com_timeouts(sessao, VERIFICATION_TIMEOUT, VERIFIED_IDLE_TIMEOUT)
 }
 
-fn executar_verificacao_interativa_com_timeout(
+fn executar_sessao_interativa_com_timeouts(
     sessao: SessaoEstabelecida,
     timeout_verificacao: Duration,
+    timeout_idle: Duration,
 ) -> Result<ResultadoInterativo, DynError> {
     let (mut stream, canal) = sessao.into_parts();
     let mut verificacao = SessaoVerificacao::new(canal);
     let deadline_verificacao = Instant::now() + timeout_verificacao;
-    let (tx, rx) = mpsc::channel();
+    // O limite evita acúmulo ilimitado de linhas plaintext ou frames pendentes.
+    let (tx, rx) = mpsc::sync_channel(1);
 
     println!("Estado: UNVERIFIED");
     println!("\nFingerprint:\n{}", verificacao.fingerprint());
@@ -368,41 +457,60 @@ fn executar_verificacao_interativa_com_timeout(
     print!("Escolha: ");
     io::stdout().flush()?;
 
-    iniciar_leitura_usuario(tx.clone());
-    iniciar_leitura_rede(
-        stream.try_clone()?,
-        tx,
-        deadline_verificacao + CLOSE_RESPONSE_TIMEOUT,
-    );
+    iniciar_leitura_verificacao(tx.clone());
+    iniciar_leitura_rede(stream.try_clone()?, tx.clone());
 
     let mut close_deadline = None;
+    let mut controle_idle = None;
+    let mut entrada_chat_iniciada = false;
     let mut chegou_a_verified = false;
 
     loop {
-        if verificacao.estado() == EstadoSessao::Verified && close_deadline.is_none() {
+        if verificacao.estado() == EstadoSessao::Verified && !entrada_chat_iniciada {
             chegou_a_verified = true;
+            entrada_chat_iniciada = true;
+            controle_idle = Some(ControleIdle::new(timeout_idle, Instant::now()));
             println!("\nEstado: VERIFIED");
             println!("Verificação mútua coordenada.");
-            println!("CHAT ainda não está implementado.");
-
-            let deadline = Instant::now() + CLOSE_RESPONSE_TIMEOUT;
-            let close = verificacao.iniciar_close(MotivoClose::Normal)?;
-            escrever_frame(&mut stream, &close, deadline)?;
-            close_deadline = Some(deadline);
+            println!("Digite mensagens ou /sair para encerrar.");
+            iniciar_leitura_chat(tx.clone());
         }
 
-        let deadline_atual = close_deadline.unwrap_or(deadline_verificacao);
+        let deadline_atual = match verificacao.estado() {
+            EstadoSessao::Unverified => deadline_verificacao,
+            EstadoSessao::Verified => {
+                controle_idle
+                    .as_ref()
+                    .expect("VERIFIED possui idle deadline")
+                    .deadline
+            }
+            EstadoSessao::Closing => close_deadline.expect("CLOSING possui close deadline"),
+            EstadoSessao::Closed | EstadoSessao::Failed => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(ResultadoInterativo::ProtocolFailure);
+            }
+        };
         let espera = match deadline_atual.checked_duration_since(Instant::now()) {
             Some(espera) if !espera.is_zero() => espera,
             _ => {
-                return tratar_timeout(&mut verificacao, &mut stream, close_deadline.is_some());
+                if let Some(resultado) =
+                    tratar_timeout(&mut verificacao, &mut stream, &mut close_deadline)?
+                {
+                    return Ok(resultado);
+                }
+                continue;
             }
         };
 
         let evento = match rx.recv_timeout(espera) {
             Ok(evento) => evento,
             Err(RecvTimeoutError::Timeout) => {
-                return tratar_timeout(&mut verificacao, &mut stream, close_deadline.is_some());
+                if let Some(resultado) =
+                    tratar_timeout(&mut verificacao, &mut stream, &mut close_deadline)?
+                {
+                    return Ok(resultado);
+                }
+                continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 verificacao.registrar_interrupcao();
@@ -411,7 +519,7 @@ fn executar_verificacao_interativa_com_timeout(
         };
 
         match evento {
-            EventoRuntime::Usuario(decisao) => {
+            EventoRuntime::Verificacao(decisao) => {
                 if verificacao.estado() != EstadoSessao::Unverified {
                     continue;
                 }
@@ -443,6 +551,59 @@ fn executar_verificacao_interativa_com_timeout(
                     }
                 }
             }
+            EventoRuntime::LinhaChat(conteudo) => {
+                if verificacao.estado() != EstadoSessao::Verified {
+                    continue;
+                }
+                match verificacao.enviar_chat(conteudo.as_str()) {
+                    Ok(ciphertext) => {
+                        let resultado = escrever_frame(
+                            &mut stream,
+                            &ciphertext,
+                            Instant::now() + crate::framing::FRAME_PROGRESS_TIMEOUT,
+                        );
+                        if resultado.is_err() {
+                            verificacao.registrar_interrupcao();
+                            let _ = stream.shutdown(Shutdown::Both);
+                            return Ok(ResultadoInterativo::NetworkInterruption);
+                        }
+                        println!("Você: {}", conteudo.as_str());
+                        controle_idle
+                            .as_mut()
+                            .expect("VERIFIED possui controle idle")
+                            .registrar_atividade(Instant::now());
+                    }
+                    Err(erro) => {
+                        if erro.categoria() == CategoriaErroSessao::Estado {
+                            continue;
+                        }
+                        println!("Mensagem rejeitada: use entre 1 e 4096 bytes UTF-8.");
+                    }
+                }
+            }
+            EventoRuntime::EncerrarLocalmente => match verificacao.estado() {
+                EstadoSessao::Unverified => {
+                    let close = verificacao.cancelamento_local()?;
+                    let _ = escrever_frame(
+                        &mut stream,
+                        &close,
+                        Instant::now() + CLOSE_RESPONSE_TIMEOUT,
+                    );
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Ok(ResultadoInterativo::LocalCancellation);
+                }
+                EstadoSessao::Verified => {
+                    let close = verificacao.iniciar_close(MotivoClose::Normal)?;
+                    let deadline = Instant::now() + CLOSE_RESPONSE_TIMEOUT;
+                    if escrever_frame(&mut stream, &close, deadline).is_err() {
+                        verificacao.registrar_interrupcao();
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return Ok(ResultadoInterativo::NetworkInterruption);
+                    }
+                    close_deadline = Some(deadline);
+                }
+                EstadoSessao::Closing | EstadoSessao::Closed | EstadoSessao::Failed => {}
+            },
             EventoRuntime::Rede(Ok(ciphertext)) => {
                 let evento = match verificacao.processar_ciphertext(&ciphertext) {
                     Ok(evento) => evento,
@@ -464,6 +625,14 @@ fn executar_verificacao_interativa_com_timeout(
                             println!("Estado: UNVERIFIED");
                             println!("A confirmação local ainda é obrigatória.");
                         }
+                    }
+                    EventoRemoto::Chat(mut conteudo) => {
+                        println!("Peer: {conteudo}");
+                        conteudo.zeroize();
+                        controle_idle
+                            .as_mut()
+                            .expect("VERIFIED possui controle idle")
+                            .registrar_atividade(Instant::now());
                     }
                     EventoRemoto::Close { motivo, resposta } => {
                         if let Some(resposta) = resposta {
@@ -499,7 +668,7 @@ fn executar_verificacao_interativa_com_timeout(
     }
 }
 
-fn iniciar_leitura_usuario(tx: mpsc::Sender<EventoRuntime>) {
+fn iniciar_leitura_verificacao(tx: SyncSender<EventoRuntime>) {
     thread::spawn(move || {
         loop {
             let mut entrada = String::new();
@@ -517,16 +686,53 @@ fn iniciar_leitura_usuario(tx: mpsc::Sender<EventoRuntime>) {
                 },
                 Err(_) => DecisaoUsuario::Cancela,
             };
-            let _ = tx.send(EventoRuntime::Usuario(decisao));
+            let _ = tx.send(EventoRuntime::Verificacao(decisao));
             break;
         }
     });
 }
 
-fn iniciar_leitura_rede(mut stream: TcpStream, tx: mpsc::Sender<EventoRuntime>, deadline: Instant) {
+fn iniciar_leitura_chat(tx: SyncSender<EventoRuntime>) {
     thread::spawn(move || {
         loop {
-            let resultado = ler_frame(&mut stream, deadline);
+            let mut entrada = String::new();
+            match io::stdin().read_line(&mut entrada) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(EventoRuntime::EncerrarLocalmente);
+                    break;
+                }
+                Ok(_) => {
+                    remover_terminador_linha(&mut entrada);
+                    if entrada == "/sair" {
+                        entrada.zeroize();
+                        let _ = tx.send(EventoRuntime::EncerrarLocalmente);
+                        break;
+                    }
+                    if tx
+                        .send(EventoRuntime::LinhaChat(LinhaPendente(entrada)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn remover_terminador_linha(entrada: &mut String) {
+    if entrada.ends_with('\n') {
+        entrada.pop();
+        if entrada.ends_with('\r') {
+            entrada.pop();
+        }
+    }
+}
+
+fn iniciar_leitura_rede(mut stream: TcpStream, tx: SyncSender<EventoRuntime>) {
+    thread::spawn(move || {
+        loop {
+            let resultado = ler_frame_sessao(&mut stream);
             let terminal = resultado.is_err();
             if tx.send(EventoRuntime::Rede(resultado)).is_err() || terminal {
                 break;
@@ -538,21 +744,41 @@ fn iniciar_leitura_rede(mut stream: TcpStream, tx: mpsc::Sender<EventoRuntime>, 
 fn tratar_timeout(
     verificacao: &mut SessaoVerificacao,
     stream: &mut TcpStream,
-    aguardando_close: bool,
-) -> Result<ResultadoInterativo, DynError> {
-    if aguardando_close {
-        verificacao.timeout_close();
-        println!("\nTimeout aguardando resposta a CLOSE; encerramento não confirmado pelo peer.");
-        let _ = stream.shutdown(Shutdown::Both);
-        return Ok(ResultadoInterativo::CloseTimeout);
+    close_deadline: &mut Option<Instant>,
+) -> Result<Option<ResultadoInterativo>, DynError> {
+    match verificacao.estado() {
+        EstadoSessao::Closing => {
+            verificacao.timeout_close();
+            println!(
+                "\nTimeout aguardando resposta a CLOSE; encerramento não confirmado pelo peer."
+            );
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(Some(ResultadoInterativo::CloseTimeout))
+        }
+        EstadoSessao::Unverified => {
+            let close = verificacao.timeout_verificacao()?;
+            let deadline = Instant::now() + CLOSE_RESPONSE_TIMEOUT;
+            let _ = escrever_frame(stream, &close, deadline);
+            println!("\nTimeout de verificação; a sessão não foi autenticada.");
+            let _ = stream.shutdown(Shutdown::Both);
+            Ok(Some(ResultadoInterativo::VerificationTimeout))
+        }
+        EstadoSessao::Verified => {
+            let close = verificacao.timeout_idle()?;
+            let deadline = Instant::now() + CLOSE_RESPONSE_TIMEOUT;
+            if escrever_frame(stream, &close, deadline).is_err() {
+                verificacao.registrar_interrupcao();
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(Some(ResultadoInterativo::NetworkInterruption));
+            }
+            println!("\nIdle timeout; CLOSE(IDLE_TIMEOUT) enviado.");
+            *close_deadline = Some(deadline);
+            Ok(None)
+        }
+        EstadoSessao::Closed | EstadoSessao::Failed => {
+            Ok(Some(ResultadoInterativo::ProtocolFailure))
+        }
     }
-
-    let close = verificacao.timeout_verificacao()?;
-    let deadline = Instant::now() + CLOSE_RESPONSE_TIMEOUT;
-    let _ = escrever_frame(stream, &close, deadline);
-    println!("\nTimeout de verificação; a sessão não foi autenticada.");
-    let _ = stream.shutdown(Shutdown::Both);
-    Ok(ResultadoInterativo::VerificationTimeout)
 }
 
 fn nome_motivo(motivo: MotivoClose) -> &'static str {
@@ -588,6 +814,15 @@ mod tests {
             SessaoVerificacao::new(finalizar_handshake(alice, [0; 3]).unwrap()),
             SessaoVerificacao::new(finalizar_handshake(bob, [0; 3]).unwrap()),
         )
+    }
+
+    fn par_verified() -> (SessaoVerificacao, SessaoVerificacao) {
+        let (mut alice, mut bob) = par_sessoes();
+        let de_alice = alice.confirmar_localmente().unwrap();
+        let de_bob = bob.confirmar_localmente().unwrap();
+        alice.processar_ciphertext(&de_bob).unwrap();
+        bob.processar_ciphertext(&de_alice).unwrap();
+        (alice, bob)
     }
 
     fn cifrar_bruto(sessao: &mut SessaoVerificacao, plaintext: &[u8]) -> Vec<u8> {
@@ -694,6 +929,14 @@ mod tests {
             categoria_erro(alice.processar_ciphertext(&ciphertext)),
             CategoriaErroSessao::Aead
         );
+
+        let (mut alice, mut bob) = par_verified();
+        let fora_de_estado = cifrar_bruto(&mut bob, &[VERIFY_CONFIRMED]);
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&fora_de_estado)),
+            CategoriaErroSessao::Protocolo
+        );
+        assert_eq!(alice.estado(), EstadoSessao::Failed);
     }
 
     #[test]
@@ -778,5 +1021,167 @@ mod tests {
         assert_eq!(alice.estado(), EstadoSessao::Closed);
         assert_eq!(bob.estado(), EstadoSessao::Closed);
         assert!(!bob.peer_close_received);
+    }
+
+    #[test]
+    fn chat_aceita_um_e_4096_bytes_com_ciphertext_esperado() {
+        let (mut alice, mut bob) = par_verified();
+        let minimo = alice.enviar_chat("x").unwrap();
+        assert_eq!(minimo.len(), 18);
+        assert!(matches!(
+            bob.processar_ciphertext(&minimo).unwrap(),
+            EventoRemoto::Chat(conteudo) if conteudo == "x"
+        ));
+
+        let maximo = "a".repeat(MAX_CHAT_CONTENT);
+        let ciphertext = alice.enviar_chat(&maximo).unwrap();
+        assert_eq!(ciphertext.len(), 4113);
+        assert!(matches!(
+            bob.processar_ciphertext(&ciphertext).unwrap(),
+            EventoRemoto::Chat(conteudo) if conteudo.len() == MAX_CHAT_CONTENT
+        ));
+    }
+
+    #[test]
+    fn chat_local_vazio_e_4097_sao_rejeitados_sem_consumir_nonce() {
+        let (mut alice, mut bob) = par_verified();
+        assert!(alice.enviar_chat("").is_err());
+        assert!(
+            alice
+                .enviar_chat(&"a".repeat(MAX_CHAT_CONTENT + 1))
+                .is_err()
+        );
+
+        let valido = alice.enviar_chat("válido").unwrap();
+        assert!(matches!(
+            bob.processar_ciphertext(&valido).unwrap(),
+            EventoRemoto::Chat(conteudo) if conteudo == "válido"
+        ));
+    }
+
+    #[test]
+    fn chat_remoto_vazio_grande_e_utf8_invalido_falham() {
+        let (mut alice, mut bob) = par_verified();
+        let vazio = cifrar_bruto(&mut bob, &[CHAT]);
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&vazio)),
+            CategoriaErroSessao::Protocolo
+        );
+
+        let (mut alice, mut bob) = par_verified();
+        let mut grande = vec![CHAT];
+        grande.extend(std::iter::repeat_n(b'a', MAX_CHAT_CONTENT + 1));
+        let grande = cifrar_bruto(&mut bob, &grande);
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&grande)),
+            CategoriaErroSessao::Protocolo
+        );
+
+        let (mut alice, mut bob) = par_verified();
+        let invalido = cifrar_bruto(&mut bob, &[CHAT, 0xff]);
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&invalido)),
+            CategoriaErroSessao::Protocolo
+        );
+    }
+
+    #[test]
+    fn chat_antes_de_verified_e_depois_de_closing_falha() {
+        let (mut alice, mut bob) = par_sessoes();
+        assert_eq!(
+            alice.enviar_chat("não permitido").unwrap_err().categoria(),
+            CategoriaErroSessao::Estado
+        );
+        let prematuro = cifrar_bruto(&mut bob, &[CHAT, b'x']);
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&prematuro)),
+            CategoriaErroSessao::Protocolo
+        );
+
+        let (mut alice, mut bob) = par_verified();
+        alice.iniciar_close(MotivoClose::Normal).unwrap();
+        assert_eq!(
+            alice.enviar_chat("tarde").unwrap_err().categoria(),
+            CategoriaErroSessao::Estado
+        );
+        let tarde = bob.enviar_chat("tarde").unwrap();
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&tarde)),
+            CategoriaErroSessao::Protocolo
+        );
+    }
+
+    #[test]
+    fn chat_adulterado_replay_reordenado_removido_e_refletido_falha() {
+        let (mut alice, mut bob) = par_verified();
+        let mut adulterado = bob.enviar_chat("segredo").unwrap();
+        *adulterado.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&adulterado)),
+            CategoriaErroSessao::Aead
+        );
+        assert!(alice.processar_ciphertext(&adulterado).is_err());
+
+        let (mut alice, mut bob) = par_verified();
+        let replay = bob.enviar_chat("uma vez").unwrap();
+        alice.processar_ciphertext(&replay).unwrap();
+        assert!(alice.processar_ciphertext(&replay).is_err());
+
+        let (mut alice, mut bob) = par_verified();
+        let _removido = bob.enviar_chat("primeiro").unwrap();
+        let segundo = bob.enviar_chat("segundo").unwrap();
+        assert!(alice.processar_ciphertext(&segundo).is_err());
+
+        let (mut alice, _) = par_verified();
+        let refletido = alice.enviar_chat("reflexão").unwrap();
+        assert!(alice.processar_ciphertext(&refletido).is_err());
+    }
+
+    #[test]
+    fn chat_de_outra_sessao_e_type_cifrado_alterado_falham() {
+        let (_, mut bob_antigo) = par_verified();
+        let antigo = bob_antigo.enviar_chat("sessão antiga").unwrap();
+        let (mut alice_nova, _) = par_verified();
+        assert!(alice_nova.processar_ciphertext(&antigo).is_err());
+
+        let (mut alice, mut bob) = par_verified();
+        let desconhecido = cifrar_bruto(&mut bob, &[0x7f, b'x']);
+        assert_eq!(
+            categoria_erro(alice.processar_ciphertext(&desconhecido)),
+            CategoriaErroSessao::Protocolo
+        );
+    }
+
+    #[test]
+    fn idle_inicia_reseta_e_produz_close_idle_timeout() {
+        let inicio = Instant::now();
+        let mut idle = ControleIdle::new(Duration::from_secs(10), inicio);
+        assert_eq!(idle.deadline, inicio + Duration::from_secs(10));
+        idle.registrar_atividade(inicio + Duration::from_secs(3));
+        assert_eq!(idle.deadline, inicio + Duration::from_secs(13));
+
+        let (mut alice, mut bob) = par_verified();
+        let close = alice.timeout_idle().unwrap();
+        assert_eq!(alice.estado(), EstadoSessao::Closing);
+        assert!(matches!(
+            bob.processar_ciphertext(&close).unwrap(),
+            EventoRemoto::Close {
+                motivo: MotivoClose::IdleTimeout,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn comando_sair_exige_correspondencia_exata_apos_crlf() {
+        let mut comando = "/sair\r\n".to_owned();
+        remover_terminador_linha(&mut comando);
+        assert_eq!(comando, "/sair");
+
+        for mensagem in [" /sair\n", "/sair \n", "/SAIR\n"] {
+            let mut mensagem = mensagem.to_owned();
+            remover_terminador_linha(&mut mensagem);
+            assert_ne!(mensagem, "/sair");
+        }
     }
 }

@@ -42,8 +42,41 @@ pub fn ler_frame(
         "conexão encerrada antes do prefixo do frame",
     )?;
 
+    ler_frame_apos_primeiro_byte(stream, prefixo, deadline_handshake)
+}
+
+/// Aguarda o início de um frame sem fixar o deadline da fase da sessão.
+///
+/// O proprietário da sessão controla essa espera fechando o socket quando seu
+/// deadline expira. Depois do primeiro byte, o prazo fixo de progresso do frame
+/// é aplicado e não pode ser renovado por atividade local ou outros eventos.
+pub fn ler_frame_sessao(stream: &mut TcpStream) -> Result<Vec<u8>, io::Error> {
+    stream.set_read_timeout(None)?;
+    let mut prefixo = [0_u8; 4];
+    loop {
+        match stream.read(&mut prefixo[..1]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "conexão encerrada antes do prefixo do frame",
+                ));
+            }
+            Ok(_) => break,
+            Err(erro) if erro.kind() == io::ErrorKind::Interrupted => continue,
+            Err(erro) => return Err(erro),
+        }
+    }
+
+    ler_frame_apos_primeiro_byte(stream, prefixo, Instant::now() + FRAME_PROGRESS_TIMEOUT)
+}
+
+fn ler_frame_apos_primeiro_byte(
+    stream: &mut TcpStream,
+    mut prefixo: [u8; 4],
+    deadline_fase: Instant,
+) -> Result<Vec<u8>, io::Error> {
     let deadline_frame = Instant::now() + FRAME_PROGRESS_TIMEOUT;
-    let deadline_efetivo = deadline_handshake.min(deadline_frame);
+    let deadline_efetivo = deadline_fase.min(deadline_frame);
     ler_exato_ate(
         stream,
         &mut prefixo[1..],
@@ -234,5 +267,21 @@ mod tests {
 
         assert_eq!(ler_frame(&mut servidor, deadline()).unwrap(), vec![1, 2]);
         assert_eq!(ler_frame(&mut servidor, deadline()).unwrap(), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn leitura_de_sessao_aguarda_primeiro_byte_e_entrega_frame_completo() {
+        let (mut cliente, mut servidor) = par_tcp();
+        let escritor = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            cliente.write_all(&[0]).unwrap();
+            for byte in [0_u8, 0, 2, 8, 9] {
+                thread::sleep(Duration::from_millis(2));
+                cliente.write_all(&[byte]).unwrap();
+            }
+        });
+
+        assert_eq!(ler_frame_sessao(&mut servidor).unwrap(), vec![8, 9]);
+        escritor.join().unwrap();
     }
 }
