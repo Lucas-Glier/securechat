@@ -1,3 +1,4 @@
+pub mod address;
 pub mod framing;
 pub mod noise_lab;
 pub mod tcp_handshake;
