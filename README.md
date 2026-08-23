@@ -34,14 +34,15 @@ um comprimento `u32` big-endian seguido do body, limitado a 8192 bytes. Ambos
 os lados concluem o handshake e exibem o mesmo fingerprint completo derivado do
 channel-binding value.
 
-Depois do handshake, a sessão continua `UNVERIFIED`. O laboratório cria e
-descarta o estado de transporte sem enviar mensagens de aplicação.
+Depois do handshake, a sessão permanece `UNVERIFIED` até cada usuário comparar
+o fingerprint completo por um canal independente, confirmar localmente a
+igualdade e receber um `VERIFY_CONFIRMED` autenticado do peer. Somente as duas
+condições levam a `VERIFIED`. Como `CHAT` ainda não existe, o laboratório então
+executa um encerramento autenticado e recíproco com `CLOSE`.
 
 Ainda não existem:
 
-- `VERIFY_CONFIRMED` ou transição para `VERIFIED`;
 - mensagens `CHAT`;
-- encerramento autenticado por `CLOSE`;
 - GUI ou versão Android;
 - anonimato de rede; ou
 - suporte para uso em produção.
@@ -66,10 +67,12 @@ Para executar os testes:
 cargo test
 ```
 
-Atualmente existem 18 testes cobrindo o laboratório Noise em memória, framing,
-handshake por TCP loopback e cenários adversariais controlados. Entre eles estão
-a rejeição de frames inválidos ou truncados, interrupções de conexão, payloads
-de handshake não vazios e adulterações das mensagens Noise.
+Atualmente existem 34 testes cobrindo o laboratório Noise em memória, framing,
+handshake por TCP loopback, verificação explícita, controles criptografados,
+`CLOSE` e cenários adversariais controlados. Entre eles estão a rejeição de
+frames inválidos ou truncados, interrupções de conexão, payloads de handshake
+não vazios, adulteração, replay, reflexão, reordenação e tentativas de alcançar
+`VERIFIED` sem confirmação local.
 
 ## Documentação de segurança
 

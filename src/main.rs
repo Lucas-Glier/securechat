@@ -4,6 +4,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 
 use securechat::DynError;
 use securechat::tcp_handshake::{executar_initiator, executar_responder};
+use securechat::verification::executar_verificacao_interativa;
 
 const USO: &str =
     "Uso:\n  securechat listen <ip-loopback:porta>\n  securechat connect <ip-loopback:porta>";
@@ -40,8 +41,7 @@ fn main() -> Result<(), DynError> {
     };
 
     println!("Handshake Noise XX concluído.");
-    println!("Estado: UNVERIFIED");
-    println!("Fingerprint: {}", resultado.fingerprint());
+    executar_verificacao_interativa(resultado)?;
 
     Ok(())
 }

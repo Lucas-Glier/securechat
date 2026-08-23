@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::io;
 
-use snow::{Builder, HandshakeState, params::NoiseParams};
+use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use zeroize::Zeroizing;
 
 use crate::DynError;
@@ -11,13 +11,14 @@ pub const PROLOGUE: &[u8; 15] = b"SecureChat-v0.1";
 pub const HANDSHAKE_BUFFER_SIZE: usize = 8192;
 const HANDSHAKE_HASH_SIZE: usize = 32;
 
-pub struct ResultadoHandshake {
+pub struct CanalNoise {
     handshake_hash: [u8; HANDSHAKE_HASH_SIZE],
     fingerprint: String,
     payload_lengths: [usize; 3],
+    transport: TransportState,
 }
 
-impl ResultadoHandshake {
+impl CanalNoise {
     pub fn handshake_hash(&self) -> &[u8; HANDSHAKE_HASH_SIZE] {
         &self.handshake_hash
     }
@@ -28,6 +29,10 @@ impl ResultadoHandshake {
 
     pub fn payloads_vazios(&self) -> bool {
         self.payload_lengths == [0, 0, 0]
+    }
+
+    pub(crate) fn transport_mut(&mut self) -> &mut TransportState {
+        &mut self.transport
     }
 }
 
@@ -60,7 +65,7 @@ fn criar_estado(initiator: bool) -> Result<HandshakeState, DynError> {
 pub fn finalizar_handshake(
     estado: HandshakeState,
     payload_lengths: [usize; 3],
-) -> Result<ResultadoHandshake, DynError> {
+) -> Result<CanalNoise, DynError> {
     if !estado.is_handshake_finished() {
         return Err(io::Error::other("o handshake Noise não terminou").into());
     }
@@ -68,12 +73,12 @@ pub fn finalizar_handshake(
     let handshake_hash = copiar_handshake_hash(&estado)?;
     let fingerprint = formatar_fingerprint(&handshake_hash);
     let transport = estado.into_transport_mode()?;
-    drop(transport);
 
-    Ok(ResultadoHandshake {
+    Ok(CanalNoise {
         handshake_hash,
         fingerprint,
         payload_lengths,
+        transport,
     })
 }
 
@@ -98,7 +103,7 @@ pub fn formatar_fingerprint(hash: &[u8; HANDSHAKE_HASH_SIZE]) -> String {
 }
 
 #[cfg(test)]
-fn executar_handshake_local() -> Result<(ResultadoHandshake, ResultadoHandshake), DynError> {
+fn executar_handshake_local() -> Result<(CanalNoise, CanalNoise), DynError> {
     let mut alice = criar_initiator()?;
     let mut bob = criar_responder()?;
     let mut mensagem = [0_u8; HANDSHAKE_BUFFER_SIZE];
